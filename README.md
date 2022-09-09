@@ -35,6 +35,16 @@ Every EC2 instance starts with an AMI. By default, it contains an image of the o
 To create a derivative AMI using the AWS Console, first, log into your EC2 Mac instance to make your changes. Enrollment, verification, installation, any actions you'd like to ensure are ready on first boot. Once that's done, go to the EC2 section, then select the specific instance you'd like to create the derivative AMI from. Go to *Actions -> Image & Templates -> Create image*. Give the derivative AMI a name, description, and tags (if applicable), and click 
 *Create image*. Your AMI will be ready to launch new instances from in a few minutes, and its status can be monitored in *Images -> AMIs*.
 
+## Limits of Jamf-enrolled derivative AMIs
+After a derivative AMI is created from an enrolled instance, that AMI can be run on other physical Mac hosts. If the AMI is started on a different host to the one it was created on, management of the new instance carries limitations:
+
+ * It *will* keep in place any profiles already deployed to it.
+ * It *will not* receive any new profiles scoped to it.
+ * It *will* remain in communication with Jamf via the ^jamf binary.
+ * It *will not* receive MDM commands from the Jamf server, only policy.
+ 
+With these limits in mind, considerations around managing EC2 Mac instances may be slightly different than end-user hardware, but pushing policies and packages will function as Jamf normally does.
+
 
 ### Notes
 * Copy the [enrollment.sh](enrollment.sh) file onto the instance.
