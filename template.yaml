@@ -1,0 +1,416 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Template to listen to state change events.
+Parameters:
+  JamfUrl:
+    Type: String
+    Description: The custom url for your Jamf instance
+  JamfUserName:
+    Type: String
+    Description: The user name of that provides access to your Jamf instance
+  JamfUserPassword:
+    Type: String
+    NoEcho: True
+    Description: The user name of that provides access to your Jamf instance
+  NotificationEmail:
+    Type: String
+    Description: The email address used for notification if the instance fails to enroll.
+Resources:
+  jamfSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties: 
+      Description: The Username and Password of the Jamf Account
+      SecretString: !Sub |
+        {
+          "username": "${JamfUserName}",
+          "password": "${JamfUserPassword}"
+        }
+  jamfInstallAutomation:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Content:
+        schemaVersion: "0.3"
+        description:  |
+          # EC2 Mac Jamf Enrollment
+          This automation will run when an instance enters the running state, it will then execute a set of commands on the instance to enroll the mac into Jamf.
+        assumeRole: "{{AutomationAssumeRole}}"
+        parameters:
+          InstanceId:
+            description: "ID of the Instance."
+            type: "String" 
+          AutomationAssumeRole:
+            default: ""
+            description: "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf."
+            type: "String" 
+        mainSteps:
+          - name: getInstanceType
+            action: 'aws:executeAwsApi'
+            outputs:
+              - Name: InstanceType
+                Selector: '$.Reservations[0].Instances[0].InstanceType'
+                Type: String
+              - Name: IamInstanceProfile
+                Selector: '$.Reservations[0].Instances[0].IamInstanceProfile.Arn'
+                Type: String
+            inputs:
+              Service: ec2
+              Api: DescribeInstances
+              InstanceIds:
+                - '{{InstanceId}}'
+            description: Runs the describe instance command to get the instance family
+          - name: IfEc2Mac
+            action: 'aws:branch'
+            inputs:
+              Choices:
+                - NextStep: IfNoInstanceProfile
+                  Variable: '{{getInstanceType.InstanceType}}'
+                  StringEquals: mac1.metal
+            isEnd: true
+          - name: IfNoInstanceProfile
+            action: 'aws:branch'
+            inputs:
+              Choices:
+                - Variable: '{{getInstanceType.IamInstanceProfile}}'
+                  Contains: arn
+                  NextStep: waitForSSM
+              Default: setInstanceProfile
+          - name: setInstanceProfile
+            action: 'aws:executeAwsApi'
+            inputs:
+              Service: ec2
+              Api: AssociateIamInstanceProfile
+              InstanceId: '{{InstanceId}}'
+              IamInstanceProfile:
+                Arn: !GetAtt Ec2MacSSMInstanceProfile.Arn
+          - name: waitForSSM
+            action: 'aws:waitForAwsResourceProperty'
+            timeoutSeconds: 1200
+            onFailure: 'step:notifyInstanceProfileError'
+            inputs:
+              Service: ssm
+              Api: DescribeInstanceInformation
+              Filters:
+                - Key: InstanceIds
+                  Values:
+                    - '{{InstanceId}}'
+              PropertySelector: '$.InstanceInformationList[0].PingStatus'
+              DesiredValues:
+                - Online
+          - name: getInvitation
+            action: 'aws:executeScript'
+            description: Creates the invitation
+            outputs:
+              - Name: invitation
+                Selector: $.Payload.invitation
+                Type: String
+            inputs:
+              Runtime: python3.7
+              Handler: script_handler
+              Script: !Sub |-
+                import datetime
+                import urllib3
+                import json
+                import xml.etree.ElementTree as ET
+                import boto3
+                http = urllib3.PoolManager()
+
+
+                def script_handler(event, context):
+                  sm_client = boto3.client('secretsmanager')
+                  jamf_secret_resp = sm_client.get_secret_value(SecretId='${jamfSecret}')
+                  jamf_secret = json.loads(jamf_secret_resp['SecretString'])
+
+                  jamf_user = jamf_secret['username']
+                  jamf_pwd = jamf_secret['password']
+                  jamf_instance = "${JamfUrl}"
+
+
+                  headers = urllib3.make_headers(basic_auth=f'{jamf_user}:{jamf_pwd}')
+                  
+                  resp = http.request("post", f"https://{jamf_instance}/api/v1/auth/token", fields={}, headers=headers)
+                  
+                  
+                  if resp.status == 200:
+                  
+                      body = json.loads(resp.data.decode('utf-8'))
+                      token = body["token"]
+                  
+                  
+                      validate_token = http.request("get", f"https://{jamf_instance}/api/v1/auth", headers={"Authorization": f"Bearer {token}"})
+                  
+                      if validate_token.status == 200:
+                          xmldata = f"""<computer_invitation>
+                              <invitation_type>DEFAULT</invitation_type>
+                              <expiration_date>2122-12-31 11:11:11</expiration_date>
+                              <ssh_username>{jamf_user}</ssh_username>
+                              <ssh_password>{jamf_pwd}</ssh_password>
+                              <multiple_users_allowed>true</multiple_users_allowed>
+                              <create_account_if_does_not_exist>false</create_account_if_does_not_exist>
+                              <hide_account>false</hide_account>
+                              <lock_down_ssh>false</lock_down_ssh>
+                          </computer_invitation>"""
+                          invitation = http.request("post", f"https://{jamf_instance}/JSSResource/computerinvitations/id/0", body=xmldata, headers={"content-type": "application/xml", "Authorization": f"Bearer {token}"})
+                  
+                          print (f"Status Code: {invitation.status}")
+                              
+                          if invitation.status == 200:
+                              root = ET.fromstring(invitation.data)
+                              return {'invitation': root.find("invitation").text}
+                  
+                  return {'invitation': ''}
+
+          - name: runEnrollment
+            action: 'aws:runCommand'
+            isEnd: True
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds:
+                - '{{InstanceId}}'     
+              Parameters:
+                commands:
+                  - !Sub |
+                    computerInvitation={{getInvitation.invitation}}
+                    JAMFURL=${JamfUrl}
+                    TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -s -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+                    echo $JAMFURL
+                    echo $computerInvitation
+                    whoami
+                    #Function to download and installs the Jamf binary from the $JAMFURL Server.
+
+                    jamfinstall(){
+                        /usr/bin/curl -ks "https://$JAMFURL/bin/jamf" -o /tmp/jamf
+                        /bin/mkdir -p /usr/local/jamf/bin /usr/local/bin
+                        /bin/mv /tmp/jamf /usr/local/jamf/bin
+                        /bin/chmod +x /usr/local/jamf/bin/jamf
+                        /bin/ln -s /usr/local/jamf/bin/jamf /usr/local/bin
+                    }
+
+                    # check if jamf is installed
+                    /usr/local/bin/jamf checkJSSConnection -retry 1
+                    status=$?
+
+                    if [ $status -eq 0 ]; then
+                      # `jamf` command was able to connect to the server correctly so we are enrolled.
+                      echo 'Already Jamf enrolled.'
+                      exit 0
+                    elif [ $status -eq 127 ]; then
+                      # `jamf` command not found so we are definitely not enrolled.
+                      echo 'Not already Jamf enrolled.'
+                      shouldEnroll=true
+                    else
+                      # `jamf` command exists, but had some other trouble contacting the server.
+                      echo 'Encountered a problem connecting to Jamf server.'
+
+                      if [[ "$jamfOutput" == *"Device Signature Error"* ]]; then
+                        echo 'Instance has likely moved to new physical hardware.'
+
+                        # Need to unenroll and then enroll as a new device.
+                        echo "Attempting to run 'jamf removeFramework'..."
+                        /usr/local/bin/jamf removeFramework
+                        removeStatus=${!}?
+
+                        if [ ${!removeStatus} -eq 0 ]; then
+                          echo 'Jamf enrollment removed.'
+                          shouldEnroll=true
+                        else
+                          echo "'jamf removeFramework' failed with exit code ${!removeStatus}."
+                          exit 1
+                        fi
+                      else
+                        echo "Run '/usr/local/bin/jamf checkJSSConnection' manually to troubleshoot."
+                        exit 1
+                      fi
+                    fi
+                    if $shouldEnroll ; then
+                      echo 'Attempting to enroll in Jamf Pro...'
+                        
+                        # Download binaries from public host
+                        jamfinstall
+
+                        ####################################################
+                        ## Create the configuration file at:
+                        ## /Library/Preferences/com.jamfsoftware.jamf.plist
+                        ####################################################
+                        jamfCLIPath=/usr/local/bin/jamf
+
+                        $jamfCLIPath createConf -url https://$JAMFURL/ -verifySSLCert always
+                        $jamfCLIPath setComputername --name $(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s http://169.254.169.254/latest/meta-data/instance-id)
+                        ####################################################
+                        ## Run enroll
+                        ####################################################
+                        $jamfCLIPath enroll -invitation $computerInvitation -noPolicy
+
+                        enrolled=$?
+                        if [ $enrolled -eq 0 ]
+                        then
+                        $jamfCLIPath update
+                        $jamfCLIPath policy -event enrollmentComplete
+                        enrolled=$?
+                        fi
+
+                        /bin/rm -rf /private/tmp/Binaries
+                        exit $enrolled
+                    fi
+            description: Run
+          - name: notifyInstanceProfileError
+            isEnd: True
+            action: 'aws:executeAwsApi'
+            inputs:
+              Service: sns
+              Api: Publish
+              TopicArn: !Ref EnrollmentFailureNotification
+              Subject: 'Jamf enrollment failed for EC2 Mac Instance {{InstanceId}}'
+              Message: 'Jamf enrollment failed for EC2 Mac Instance {{InstanceId}}. The instance was unable to connect to systems manager, make sure the AmazonSSMManagedInstanceCore managed policy is attached to the EC2 instance profile''s role'
+  EnrollmentFailureNotification:
+    Type: AWS::SNS::Topic
+    Properties: 
+      Subscription: 
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+
+  DLQ:
+    Type: AWS::SQS::Queue
+    Properties: 
+      Tags: 
+        - Key: IsDLQ
+          Value: True
+
+  DLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties: 
+      PolicyDocument:
+        Statement: 
+        - 
+          Effect: "Allow"
+          Principal:  
+            Service: 
+              - events.amazonaws.com
+          Action: 
+            - "SQS:SendMessage" 
+          Resource: !GetAtt DLQ.Arn
+          Condition:
+            ArnEquals:
+              "aws:SourceArn": !GetAtt EC2Listener.Arn
+      Queues: 
+        - !Ref DLQ
+
+  EC2Listener:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: Listens for EC2 Mac lifecycle events
+      EventPattern:
+        source: 
+          - aws.ec2
+        detail-type: 
+          - EC2 Instance State-change Notification
+        detail: 
+          state: 
+            - running
+      RoleArn: !GetAtt EventRuleTargetIamRole.Arn
+      State: ENABLED
+      Targets: 
+        - 
+          Arn: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${jamfInstallAutomation}:$DEFAULT
+          Id: "SSMAutomation"
+          RoleArn: !GetAtt EventRuleTargetIamRole.Arn
+          DeadLetterConfig: 
+            Arn: !GetAtt DLQ.Arn
+          InputTransformer:
+            InputPathsMap:
+              "InstanceId" : "$.detail.instance-id"
+            InputTemplate: !Sub |
+              {
+                "InstanceId": [<InstanceId>],
+                "AutomationAssumeRole": ["${SSMAutomationIamRole.Arn}"]
+              }
+  EventRuleTargetIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ""
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "events.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+      - PolicyName: pass_role
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: 
+            - iam:PassRole
+            Resource: 
+            - !GetAtt SSMAutomationIamRole.Arn
+  SSMAutomationIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole
+      - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ""
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "ssm.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+      - PolicyName: ssm_automation_permissions
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: 
+            - sns:Publish
+            Resource: !Ref EnrollmentFailureNotification
+          - Effect: Allow
+            Action: 
+            - ec2:AssociateIamInstanceProfile
+            Resource: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+          - Effect: Allow
+            Action: 
+            - iam:PassRole
+            Resource: 
+            - !GetAtt Ec2MacSSMRole.Arn
+          - Effect: Allow
+            Action:
+            - secretsmanager:GetSecretValue
+            Resource: 
+            - !Ref jamfSecret
+  Ec2MacSSMRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+  Ec2MacSSMInstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Roles:
+        - !Ref Ec2MacSSMRole
+
+Outputs:
+  jamfInstallAutomation:
+    Description: SSMDocument
+    Value: !Ref jamfInstallAutomation
