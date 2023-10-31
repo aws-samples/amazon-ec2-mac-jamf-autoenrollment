@@ -1,5 +1,11 @@
 ## EC2 Mac Auto Enrollment
 
+---
+
+Looking to add **MDM enrollment** to your workflow? Our **[new repository](https://github.com/aws-samples/amazon-ec2-mac-mdm-enrollment-automation)** has a workflow for full Jamf MDM enrollment automation.
+
+---
+
 This project is a repository for instructions and automations on how to automatically enroll [Amazon EC2 Mac](https://aws.amazon.com/pm/ec2-mac) instances into [Jamf Pro](https://www.jamf.com/).
 
 Since the release of Amazon EC2 Mac Instances, AWS customers have been able to provision Apple Mac devices in the AWS cloud. By taking advantage of AWS’ scalable and elastic infrastructure, they have been able to increase developer productivity and deliver macOS and iOS apps to market faster without the need to manage physical Mac infrastructure. Until now, there wasn’t an easy way to integrate the EC2 Mac instances into the same device management as physical Apple devices. In partnership with Jamf, the leader in Apple device management, AWS has developed integration between the Amazon EC2 Mac instances and Jamf Pro to simplify managing, securing, and configuring EC2 Mac instances. In this blog post we show the reader show how to configure their AWS and Jamf accounts to automatically enroll EC2 Mac into Jamf Pro instances when they are launched.
@@ -42,6 +48,7 @@ After a derivative AMI is created from an enrolled instance, that AMI can be run
  * It *will not* receive any new profiles scoped to it.
  * It *will* remain in communication with Jamf via the ^jamf binary.
  * It *will not* receive MDM commands from the Jamf server, only policy.
+ * * If MDM commands are required, see [this workflow](https://github.com/aws-samples/amazon-ec2-mac-mdm-enrollment-automation) instead.
  
 With these limits in mind, considerations around managing EC2 Mac instances may be slightly different than end-user hardware, but pushing policies and packages will function as Jamf normally does.
 
