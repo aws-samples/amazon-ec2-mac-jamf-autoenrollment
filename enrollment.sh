@@ -1,3 +1,4 @@
+set -x
 TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -s -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 echo $JAMFURL
 echo $computerInvitation
@@ -47,9 +48,10 @@ else
     exit 1
   fi
 fi
+
 if $shouldEnroll ; then
   echo 'Attempting to enroll in Jamf Pro...'
-    
+
     # Download binaries from public host
     jamfinstall
 
@@ -76,3 +78,4 @@ if $shouldEnroll ; then
 
     /bin/rm -rf /private/tmp/Binaries
     exit $enrolled
+fi
